@@ -56,7 +56,7 @@ dependencies = [
     "scipy>=1.13.1",
     "uvicorn>=0.34.2",
     "genai-perf",
-    "bokeh==3.4.1",
+    "bokeh~=3.8",
     "nvidia-ml-py"
 ]
 
