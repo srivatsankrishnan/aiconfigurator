@@ -317,6 +317,74 @@ def disagg_pareto(
     return summary.get_summary_df()
 
 
+def disagg_pareto_cql(
+    predictor,
+    model_path: str,
+    system: str,
+    backend: str,
+    version: str,
+    isl: int,
+    osl: int,
+    prefill_parallel_config_list: list[list[int]],
+    decode_parallel_config_list: list[list[int]],
+    num_gpu_list: list[int] | None = None,
+    max_num_gpu: int | None = None,
+    prefill_max_num_worker: int | None = None,
+    decode_max_num_worker: int | None = None,
+    ttft_sla: float | None = None,
+    bs_range: range = range(1, 257),
+) -> pd.DataFrame:
+    prefill_workers_max = prefill_max_num_worker or 16
+    decode_workers_max = decode_max_num_worker or 16
+    max_gpus = max_num_gpu or (max(num_gpu_list) if num_gpu_list else 64)
+
+    configs = []
+    for p_tp, p_pp, p_dp, p_moe_tp, p_moe_ep in prefill_parallel_config_list:
+        for d_tp, d_pp, d_dp, d_moe_tp, d_moe_ep in decode_parallel_config_list:
+            p_gpus_per_worker = p_tp * p_pp
+            d_gpus_per_worker = d_tp * d_pp
+            for p_w in range(1, prefill_workers_max + 1):
+                for d_w in range(1, decode_workers_max + 1):
+                    total = p_gpus_per_worker * p_w + d_gpus_per_worker * d_w
+                    if total > max_gpus:
+                        continue
+                    if num_gpu_list and total not in num_gpu_list:
+                        continue
+                    for p_bs in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+                        for d_bs in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+                            configs.append({
+                                "p_tp": p_tp, "p_pp": p_pp, "p_bs": p_bs, "p_workers": p_w,
+                                "p_dp": p_dp,
+                                "d_tp": d_tp, "d_pp": d_pp, "d_bs": d_bs, "d_workers": d_w,
+                                "d_dp": d_dp,
+                            })
+
+    if not configs:
+        logger.warning("CQL pareto: no valid configs for %s", model_path)
+        return pd.DataFrame()
+
+    logger.info("CQL pareto: evaluating %d configs for %s", len(configs), model_path)
+    df = predictor.predict_batch(model_path, system, backend, version, isl, osl, configs)
+
+    from aiconfigurator.sdk.predictors.pareto import filter_feasible
+    from aiconfigurator.sdk.predictors.pareto import get_pareto_front as cql_pareto_front
+
+    df = filter_feasible(df)
+    if df.empty:
+        logger.warning("CQL pareto: no feasible configs for %s", model_path)
+        return df
+
+    if ttft_sla is not None:
+        df = df[df["ttft"] <= ttft_sla].reset_index(drop=True)
+        if df.empty:
+            logger.warning("CQL pareto: no configs meet TTFT SLA %.1f ms for %s", ttft_sla, model_path)
+            return df
+
+    pareto = cql_pareto_front(df, "tokens/s/gpu", "tokens/s/user")
+    logger.info("CQL pareto: %d Pareto-optimal configs from %d feasible", len(pareto), len(df))
+    return pareto
+
+
 def get_pareto_front(
     df: pd.DataFrame,
     x_col: str,

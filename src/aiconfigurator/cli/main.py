@@ -239,6 +239,21 @@ def _add_default_mode_arguments(parser):
         "When set, MoE models use EP-only parallelism with deepep_moe backend. "
         "Applies to both DeepSeek and Qwen3-235B on SGLang.",
     )
+    parser.add_argument(
+        "--predictor",
+        choices=["analytical", "cql"],
+        type=str,
+        default="analytical",
+        help="Predictor to use for performance estimation. "
+        "'analytical' (default) uses the perf database simulation. "
+        "'cql' uses a CQL-trained neural predictor (requires --checkpoint).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to CQL checkpoint directory. Required when --predictor=cql.",
+    )
 
 
 def _add_experiments_mode_arguments(parser):
@@ -472,6 +487,21 @@ def _add_estimate_mode_arguments(parser):
         "Controls how many KV blocks TRT-LLM pre-allocates per sequence. "
         "Set this to match your actual deployment to get an accurate KV cache capacity warning.",
     )
+    parser.add_argument(
+        "--predictor",
+        choices=["analytical", "cql"],
+        type=str,
+        default="analytical",
+        help="Predictor to use for performance estimation. "
+        "'analytical' (default) uses the perf database simulation. "
+        "'cql' uses a CQL-trained neural predictor (requires --checkpoint).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to CQL checkpoint directory. Required when --predictor=cql.",
+    )
 
 
 def _add_support_mode_arguments(parser):
@@ -693,6 +723,8 @@ def build_default_task_configs(
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
     enable_wideep: bool = False,
+    predictor: str = "analytical",
+    checkpoint: str | None = None,
 ) -> dict[str, TaskConfig]:
     """Build agg and disagg task configs for default mode comparison.
 
@@ -715,6 +747,8 @@ def build_default_task_configs(
         nextn_accept_rates: Acceptance rates for MTP draft tokens.
         enable_chunked_prefill: Whether to enable chunked prefill for finer context token sweep.
         enable_wideep: Whether to enable Wide Expert Parallelism (WideEP) for MoE models.
+        predictor: Predictor to use ('analytical' or 'cql').
+        checkpoint: Path to CQL checkpoint (required when predictor='cql').
 
     Returns:
         Dict with TaskConfig objects. When backend='auto', returns 6 configs
@@ -792,15 +826,17 @@ def build_default_task_configs(
     if enable_wideep:
         common_kwargs["moe_backend"] = "deepep_moe"
 
-    # Create yaml_config to pass nextn and nextn_accept_rates if specified
+    # Create yaml_config to pass nextn, nextn_accept_rates, and predictor settings
     yaml_config = None
+    yaml_config_section: dict = {}
     if nextn > 0:
-        yaml_config = {
-            "config": {
-                "nextn": nextn,
-                "nextn_accept_rates": nextn_accept_rates,
-            }
-        }
+        yaml_config_section["nextn"] = nextn
+        yaml_config_section["nextn_accept_rates"] = nextn_accept_rates
+    if predictor != "analytical":
+        yaml_config_section["predictor"] = predictor
+        yaml_config_section["checkpoint"] = checkpoint
+    if yaml_config_section:
+        yaml_config = {"config": yaml_config_section}
 
     task_configs: dict[str, TaskConfig] = {}
     is_moe_model = check_is_moe(model_path)
@@ -1444,6 +1480,8 @@ def _run_estimate_mode(args):
         comm_quant_mode=args.comm_quant_mode,
         free_gpu_memory_fraction=args.free_gpu_memory_fraction,
         max_seq_len=args.max_seq_len,
+        predictor=getattr(args, "predictor", "analytical"),
+        checkpoint=getattr(args, "checkpoint", None),
     )
 
     if estimate_mode == "disagg":
@@ -1574,6 +1612,12 @@ def main(args):
             args.tpot,
             args.backend,
         )
+        predictor = getattr(args, "predictor", "analytical")
+        checkpoint = getattr(args, "checkpoint", None)
+        if predictor == "cql" and not checkpoint:
+            logger.error("--checkpoint is required when --predictor=cql")
+            raise SystemExit(1)
+
         task_configs = build_default_task_configs(
             model_path=args.model_path,
             total_gpus=args.total_gpus,
@@ -1594,6 +1638,8 @@ def main(args):
             free_gpu_memory_fraction=args.free_gpu_memory_fraction,
             max_seq_len=args.max_seq_len,
             enable_wideep=getattr(args, "enable_wideep", False),
+            predictor=predictor,
+            checkpoint=checkpoint,
         )
     elif args.mode == "exp":
         try:

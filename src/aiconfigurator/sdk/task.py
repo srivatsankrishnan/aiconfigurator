@@ -1252,7 +1252,73 @@ class TaskRunner:
             "pareto_df": result_df,
         }
 
+    def _run_disagg_cql(self, task_config: DefaultMunch) -> dict[str, pd.DataFrame | None]:
+        from aiconfigurator.sdk import pareto_analysis as pa
+        from aiconfigurator.sdk.predictors.cql_predictor import CQLPredictor
+
+        checkpoint = task_config.checkpoint
+        logger.info("Task %s: Using CQL predictor from %s", task_config.task_name, checkpoint)
+
+        try:
+            predictor = CQLPredictor.from_checkpoint(checkpoint)
+        except Exception:
+            logger.exception("Failed to load CQL checkpoint from %s", checkpoint)
+            return None
+
+        model_path = task_config.model_path
+        system = task_config.prefill_worker_config.system_name
+        backend = task_config.prefill_worker_config.backend_name
+        version = task_config.prefill_worker_config.backend_version
+        isl = task_config.runtime_config.isl
+        osl = task_config.runtime_config.osl
+        max_num_gpu = task_config.replica_config.max_gpu_per_replica
+
+        try:
+            result_df = pa.disagg_pareto_cql(
+                predictor=predictor,
+                model_path=model_path,
+                system=system,
+                backend=backend,
+                version=version,
+                isl=isl,
+                osl=osl,
+                prefill_parallel_config_list=enumerate_parallel_config(
+                    num_gpu_list=task_config.prefill_worker_config.num_gpu_per_worker,
+                    tp_list=task_config.prefill_worker_config.tp_list,
+                    pp_list=task_config.prefill_worker_config.pp_list,
+                    dp_list=task_config.prefill_worker_config.dp_list,
+                    moe_tp_list=task_config.prefill_worker_config.moe_tp_list,
+                    moe_ep_list=task_config.prefill_worker_config.moe_ep_list,
+                    is_moe=check_is_moe(model_path),
+                    backend=common.BackendName(backend),
+                ),
+                decode_parallel_config_list=enumerate_parallel_config(
+                    num_gpu_list=task_config.decode_worker_config.num_gpu_per_worker,
+                    tp_list=task_config.decode_worker_config.tp_list,
+                    pp_list=task_config.decode_worker_config.pp_list,
+                    dp_list=task_config.decode_worker_config.dp_list,
+                    moe_tp_list=task_config.decode_worker_config.moe_tp_list,
+                    moe_ep_list=task_config.decode_worker_config.moe_ep_list,
+                    is_moe=check_is_moe(model_path),
+                    backend=common.BackendName(backend),
+                ),
+                num_gpu_list=task_config.replica_config.num_gpu_per_replica,
+                max_num_gpu=max_num_gpu,
+                prefill_max_num_worker=task_config.replica_config.max_prefill_worker,
+                decode_max_num_worker=task_config.replica_config.max_decode_worker,
+                ttft_sla=task_config.runtime_config.ttft,
+            )
+        except Exception:
+            logger.exception("CQL prediction failed for %s, falling back to analytical", model_path)
+            return self.run_disagg.__wrapped__(self, task_config) if hasattr(self.run_disagg, '__wrapped__') else None
+
+        return {"pareto_df": result_df}
+
     def run_disagg(self, task_config: DefaultMunch, autoscale: bool = False) -> dict[str, pd.DataFrame | None]:
+        predictor = getattr(task_config, "predictor", "analytical")
+        if predictor == "cql" and getattr(task_config, "checkpoint", None):
+            return self._run_disagg_cql(task_config)
+
         logger.debug("Task %s: Setting up runtime config", task_config.task_name)
         runtime_config = config.RuntimeConfig(
             isl=task_config.runtime_config.isl,

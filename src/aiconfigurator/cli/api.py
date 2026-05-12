@@ -626,6 +626,8 @@ def cli_estimate(
     systems_paths: str | None = None,
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
+    predictor: str = "analytical",
+    checkpoint: str | None = None,
 ) -> EstimateResult:
     """
     Estimate TTFT, TPOT, and power for a single model/system/config combination.
@@ -766,6 +768,25 @@ def cli_estimate(
         ]:
             if val is None:
                 raise ValueError(f"{name} is required for disagg mode.")
+
+        if predictor == "cql" and checkpoint:
+            return _run_disagg_estimate_cql(
+                model_path=model_path,
+                system_name=system_name,
+                backend_name=backend_name,
+                resolved_version=resolved_version,
+                isl=isl,
+                osl=osl,
+                checkpoint=checkpoint,
+                prefill_tp_size=prefill_tp_size if prefill_tp_size is not None else tp_size,
+                prefill_pp_size=prefill_pp_size if prefill_pp_size is not None else pp_size,
+                prefill_batch_size=prefill_batch_size,
+                prefill_num_workers=prefill_num_workers,
+                decode_tp_size=decode_tp_size if decode_tp_size is not None else tp_size,
+                decode_pp_size=decode_pp_size if decode_pp_size is not None else pp_size,
+                decode_batch_size=decode_batch_size,
+                decode_num_workers=decode_num_workers,
+            )
 
         return _run_disagg_estimate(
             model_path=model_path,
@@ -1050,6 +1071,87 @@ def _run_disagg_estimate(
         raw=result_dict,
         mode="disagg",
         per_ops_data=summary.get_per_ops_data(),
+    )
+
+
+def _run_disagg_estimate_cql(
+    *,
+    model_path,
+    system_name,
+    backend_name,
+    resolved_version,
+    isl,
+    osl,
+    checkpoint,
+    prefill_tp_size,
+    prefill_pp_size,
+    prefill_batch_size,
+    prefill_num_workers,
+    decode_tp_size,
+    decode_pp_size,
+    decode_batch_size,
+    decode_num_workers,
+) -> EstimateResult:
+    from aiconfigurator.sdk.predictors.cql_predictor import CQLPredictor
+
+    predictor = CQLPredictor.from_checkpoint(checkpoint)
+    preds = predictor.predict_single(
+        model_path=model_path,
+        system=system_name,
+        backend=backend_name,
+        version=resolved_version,
+        isl=isl,
+        osl=osl,
+        p_tp=prefill_tp_size,
+        p_pp=prefill_pp_size,
+        p_bs=prefill_batch_size,
+        p_workers=prefill_num_workers,
+        d_tp=decode_tp_size,
+        d_pp=decode_pp_size,
+        d_bs=decode_batch_size,
+        d_workers=decode_num_workers,
+    )
+
+    ttft, tpot = preds["ttft"], preds["tpot"]
+    p_gpus = prefill_tp_size * prefill_pp_size * prefill_num_workers
+    d_gpus = decode_tp_size * decode_pp_size * decode_num_workers
+    num_total_gpus = p_gpus + d_gpus
+    request_latency = ttft + tpot * max(osl - 1, 0)
+    tokens_s_user = 1000.0 / tpot if tpot > 0 else 0.0
+    tokens_s = tokens_s_user * osl
+    tokens_s_gpu = tokens_s / num_total_gpus if num_total_gpus > 0 else 0.0
+    seq_s_gpu = tokens_s_user / num_total_gpus if num_total_gpus > 0 else 0.0
+
+    result_dict = {
+        "ttft": ttft, "tpot": tpot, "request_latency": request_latency,
+        "power_w": 0.0,
+        "tokens/s": tokens_s, "tokens/s/gpu": tokens_s_gpu,
+        "tokens/s/user": tokens_s_user,
+        "seq/s": tokens_s_user, "seq/s/gpu": seq_s_gpu,
+        "num_total_gpus": num_total_gpus,
+        "(p)tp": prefill_tp_size, "(p)pp": prefill_pp_size,
+        "(p)bs": prefill_batch_size, "(p)workers": prefill_num_workers,
+        "(d)tp": decode_tp_size, "(d)pp": decode_pp_size,
+        "(d)bs": decode_batch_size, "(d)workers": decode_num_workers,
+        "feasibility": preds["feasibility"],
+    }
+
+    return EstimateResult(
+        ttft=ttft,
+        tpot=tpot,
+        power_w=0.0,
+        isl=isl,
+        osl=osl,
+        batch_size=prefill_batch_size,
+        ctx_tokens=0,
+        tp_size=prefill_tp_size,
+        pp_size=prefill_pp_size,
+        model_path=model_path,
+        system_name=system_name,
+        backend_name=backend_name,
+        backend_version=resolved_version,
+        raw=result_dict,
+        mode="disagg",
     )
 
 
