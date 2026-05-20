@@ -22,6 +22,7 @@ from aiconfigurator.sdk.common import (
     DefaultHFModels,
     HybridMoEConfig,
     Qwen35Config,
+    VisionEncoderConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -477,7 +478,15 @@ def _parse_hf_config_json(config: dict) -> dict:
         # Merge quantization_config from text_config if not present at top level
         if "quantization_config" not in config and "quantization_config" in text_cfg:
             config["quantization_config"] = text_cfg["quantization_config"]
+        # Preserve encoder configs before flattening so they can be used
+        # by the encoder operation builder in models.py.
+        encoder_configs = {}
+        for enc_key in ("vision_config", "audio_config", "vision_tower_config"):
+            if enc_key in config and isinstance(config[enc_key], dict):
+                encoder_configs[enc_key] = config[enc_key]
         config = {**text_cfg, **{"architectures": [architecture]}}
+        if encoder_configs:
+            config["_encoder_configs"] = encoder_configs
 
     if architecture not in ARCHITECTURE_TO_MODEL_FAMILY:
         raise ValueError(
@@ -502,9 +511,14 @@ def _parse_hf_config_json(config: dict) -> dict:
     moe_inter_size = config.get("moe_intermediate_size", 0) or config.get("intermediate_size", 0)
 
     # Handle NemotronH-specific configuration (only fields unique to NemotronH)
+    _nemotronh_archs = {
+        "NemotronHForCausalLM",
+        "NemotronHNanoOmniReasoningV3ForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+    }
     extra_params = None
-    if architecture == "NemotronHForCausalLM":
-        extra_params = common.NemotronHConfig(
+    if architecture in _nemotronh_archs:
+        nemotronh_cfg = common.NemotronHConfig(
             hybrid_override_pattern=config["hybrid_override_pattern"],
             mamba_num_heads=config["mamba_num_heads"],
             mamba_head_dim=config["mamba_head_dim"],
@@ -512,13 +526,47 @@ def _parse_hf_config_json(config: dict) -> dict:
             conv_kernel=config["conv_kernel"],
             n_groups=config["n_groups"],
             chunk_size=config["chunk_size"],
-            # Optional: 0 for non-MoE NemotronH models (e.g., Nemotron-H-56B)
             moe_shared_expert_intermediate_size=config.get("moe_shared_expert_intermediate_size", 0),
         )
         logger.info(
-            f"NemotronH hybrid config: pattern={extra_params.hybrid_override_pattern}, "
-            f"mamba_heads={extra_params.mamba_num_heads}"
+            f"NemotronH hybrid config: pattern={nemotronh_cfg.hybrid_override_pattern}, "
+            f"mamba_heads={nemotronh_cfg.mamba_num_heads}"
         )
+        # For multimodal Omni variant, attach encoder configs alongside the NemotronH config.
+        encoder_cfgs = config.get("_encoder_configs")
+        if encoder_cfgs:
+            vision_cfg_dict = encoder_cfgs.get("vision_config") or encoder_cfgs.get("vision_tower_config")
+            vision_encoder = None
+            if vision_cfg_dict and isinstance(vision_cfg_dict, dict):
+                # C-RADIO (used by Nemotron Omni) stores ViT spec under "args"
+                # and uses preferred_resolution instead of image_size.
+                # Standard ViT configs use top-level hidden_size/num_attention_heads.
+                args = vision_cfg_dict.get("args", {})
+                preferred_res = vision_cfg_dict.get("preferred_resolution")
+                img_size = (
+                    preferred_res[0] if isinstance(preferred_res, (list, tuple)) and preferred_res
+                    else vision_cfg_dict.get("image_size", 384)
+                )
+                vision_encoder = VisionEncoderConfig(
+                    hidden_size=vision_cfg_dict.get("hidden_size", 1280),
+                    num_attention_heads=vision_cfg_dict.get("num_attention_heads", 16),
+                    num_hidden_layers=vision_cfg_dict.get("num_hidden_layers", 32),
+                    intermediate_size=vision_cfg_dict.get("intermediate_size", 5120),
+                    patch_size=vision_cfg_dict.get("patch_size") or args.get("patch_size", 16),
+                    image_size=img_size,
+                    num_channels=vision_cfg_dict.get("num_channels", 3),
+                )
+                logger.info(
+                    "Vision encoder config: hidden=%d, layers=%d, heads=%d, patch=%d, image=%d",
+                    vision_encoder.hidden_size,
+                    vision_encoder.num_hidden_layers,
+                    vision_encoder.num_attention_heads,
+                    vision_encoder.patch_size,
+                    vision_encoder.image_size,
+                )
+            extra_params = {"nemotronh_config": nemotronh_cfg, "vision_encoder": vision_encoder}
+        else:
+            extra_params = nemotronh_cfg
     elif architecture == "DeciLMForCausalLM":
         if "block_configs" in config:
             extra_params = _parse_nemotron_block_configs(config["block_configs"])

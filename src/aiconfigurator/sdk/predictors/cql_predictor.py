@@ -177,13 +177,19 @@ def _encode_action(p_tp, p_pp, p_bs, p_workers, d_tp, d_pp, d_bs, d_workers) -> 
 
 def _build_residual_network(state_dim: int, action_dim: int,
                             hidden_dim: int = 512, num_blocks: int = 4,
-                            dropout: float = 0.05):
+                            dropout: float = 0.05, multi_head: bool = True):
     import torch.nn as nn
 
     def _residual_block(dim):
         return nn.Sequential(
             nn.LayerNorm(dim), nn.Linear(dim, dim * 2),
             nn.GELU(), nn.Dropout(dropout), nn.Linear(dim * 2, dim),
+        )
+
+    def _output_head(dim):
+        return nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim // 2),
+            nn.GELU(), nn.Linear(dim // 2, 1),
         )
 
     class _Net(nn.Module):
@@ -196,19 +202,13 @@ def _build_residual_network(state_dim: int, action_dim: int,
             self.blocks = nn.ModuleList([
                 _residual_block(hidden_dim) for _ in range(num_blocks)
             ])
-            self.ttft_head = nn.Sequential(
-                nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(), nn.Linear(hidden_dim // 2, 1),
-            )
-            self.tpot_head = nn.Sequential(
-                nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(), nn.Linear(hidden_dim // 2, 1),
-            )
-            self.feasibility_head = nn.Sequential(
-                nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(), nn.Linear(hidden_dim // 2, 1),
-            )
-            self.head = self.ttft_head
+            if multi_head:
+                self.ttft_head = _output_head(hidden_dim)
+                self.tpot_head = _output_head(hidden_dim)
+                self.feasibility_head = _output_head(hidden_dim)
+                self.head = self.ttft_head
+            else:
+                self.head = _output_head(hidden_dim)
 
         def _encode(self, x):
             h = self.input_proj(x)
@@ -217,11 +217,14 @@ def _build_residual_network(state_dim: int, action_dim: int,
             return h
 
         def forward(self, x):
-            return self.ttft_head(self._encode(x))
+            return self.head(self._encode(x))
 
         def forward_triple(self, x):
             h = self._encode(x)
-            return self.ttft_head(h), self.tpot_head(h), self.feasibility_head(h)
+            if hasattr(self, "ttft_head"):
+                return self.ttft_head(h), self.tpot_head(h), self.feasibility_head(h)
+            out = self.head(h)
+            return out, out, out
 
     return _Net()
 
@@ -237,7 +240,9 @@ def _load_network(checkpoint_path: str | Path, device: str = "cpu"):
     num_blocks = ckpt.get("num_blocks") or dims.get("num_blocks", 4)
     net_state = ckpt.get("q_net_state_dict") or ckpt.get("model", {})
 
-    net = _build_residual_network(state_dim, action_dim, hidden_dim, num_blocks)
+    multi_head = any(k.startswith("ttft_head") for k in net_state)
+    net = _build_residual_network(state_dim, action_dim, hidden_dim, num_blocks,
+                                  multi_head=multi_head)
     net.load_state_dict(net_state)
     net.to(device)
     net.eval()

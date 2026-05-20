@@ -54,3 +54,7 @@ class RuntimeConfig:
     seq_imbalance_correction_scale: float = 1.0
     # Separate correction scale for generation/decoding stage (do NOT reuse ctx scale).
     gen_seq_imbalance_correction_scale: float = 1.0
+    # Multimodal input dimensions (0 = text-only, no encoder overhead)
+    num_image_patches: int = 0
+    num_video_frames: int = 0
+    video_pruning_rate: float = 0.0

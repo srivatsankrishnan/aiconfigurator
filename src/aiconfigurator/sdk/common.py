@@ -137,6 +137,23 @@ class DeepSeekV4Config:
     n_shared_experts: int = 1
 
 
+@dataclass(frozen=True)
+class VisionEncoderConfig:
+    """Configuration for a vision encoder (e.g., ViT) attached to a multimodal model.
+
+    Parsed from the ``vision_config`` sub-dictionary of a HuggingFace config.json.
+    All fields have defaults matching C-RADIOv4-H used in Nemotron Omni.
+    """
+
+    hidden_size: int = 1280
+    num_attention_heads: int = 16
+    num_hidden_layers: int = 32
+    intermediate_size: int = 5120
+    patch_size: int = 14
+    image_size: int = 384
+    num_channels: int = 3
+
+
 def indexer_cache_entry_bytes(index_head_dim: int) -> int:
     """Bytes per token in the FP8 indexer KV cache, including one scale per 128 values."""
     return index_head_dim + ((index_head_dim + 127) // 128) * 4
@@ -371,6 +388,8 @@ DefaultHFModels = {
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "nvidia/Nemotron-H-56B-Base-8K",
+    "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+    "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
 }
 
 """
@@ -427,6 +446,8 @@ ARCHITECTURE_TO_MODEL_FAMILY = {
     "Llama4ForConditionalGeneration": "HYBRIDMOE",
     "Qwen3_5ForConditionalGeneration": "QWEN35",
     "Qwen3_5MoeForConditionalGeneration": "QWEN35",
+    "NemotronHNanoOmniReasoningV3ForConditionalGeneration": "NEMOTRONH",
+    "NemotronH_Nano_Omni_Reasoning_V3": "NEMOTRONH",
 }
 
 # Multimodal architectures whose LLM config lives under a nested key (e.g. "text_config").
@@ -436,6 +457,8 @@ MULTIMODAL_TEXT_CONFIG_KEY = {
     "Llama4ForConditionalGeneration": "text_config",
     "Qwen3_5ForConditionalGeneration": "text_config",
     "Qwen3_5MoeForConditionalGeneration": "text_config",
+    "NemotronHNanoOmniReasoningV3ForConditionalGeneration": "llm_config",
+    "NemotronH_Nano_Omni_Reasoning_V3": "llm_config",
 }
 
 """

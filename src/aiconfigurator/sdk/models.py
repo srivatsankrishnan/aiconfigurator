@@ -509,8 +509,16 @@ def get_model(
             context,
             model_config,
         )
-        # extra_params is NemotronHConfig with hybrid layer configuration
-        model.set_hybrid_config(extra_params)
+        # extra_params is either a NemotronHConfig (text-only) or a dict with
+        # {"nemotronh_config": NemotronHConfig, "vision_encoder": VisionEncoderConfig}
+        # for multimodal Omni models.
+        if isinstance(extra_params, dict) and "nemotronh_config" in extra_params:
+            model.set_hybrid_config(extra_params["nemotronh_config"])
+            vision_encoder = extra_params.get("vision_encoder")
+            if vision_encoder is not None:
+                model.set_vision_encoder(vision_encoder)
+        else:
+            model.set_hybrid_config(extra_params)
     elif model_family == "QWEN35":
         model = Qwen35Model(
             model_path,
@@ -611,6 +619,7 @@ class BaseModel:
         self._use_qk_norm = bool(extra_params.get("use_qk_norm", False)) if isinstance(extra_params, dict) else False
         self.context_ops = []
         self.generation_ops = []
+        self.encoder_ops = []
 
         # internal only
         self._num_layers = num_layers
@@ -4758,6 +4767,61 @@ class NemotronHModel(BaseModel):
                 common.GEMMQuantMode.bfloat16,
             )
         )
+
+    def set_vision_encoder(self, vision_encoder: common.VisionEncoderConfig) -> None:
+        """Build encoder_ops for a ViT-style vision encoder.
+
+        Uses standard GEMM and ContextAttention ops — the same kernel types already
+        profiled in the perf database — with dimensions from the vision encoder config.
+        The encoder is modeled as running on a single GPU (not TP-sharded).
+        """
+        self._vision_encoder = vision_encoder
+        self._build_encoder_ops(vision_encoder)
+
+    def _build_encoder_ops(self, enc: common.VisionEncoderConfig) -> None:
+        """Build Operation list for a ViT encoder from its config."""
+        h = enc.hidden_size
+        num_heads = enc.num_attention_heads
+        head_dim = h // num_heads
+        inter = enc.intermediate_size
+        num_layers = enc.num_hidden_layers
+        gemm_qm = common.GEMMQuantMode.bfloat16
+        kv_qm = common.KVCacheQuantMode.bfloat16
+        fmha_qm = common.FMHAQuantMode.bfloat16
+
+        self.encoder_ops = []
+
+        # Patch embedding: (patch_size^2 * channels) -> hidden
+        patch_dim = enc.patch_size * enc.patch_size * enc.num_channels
+        self.encoder_ops.append(ops.GEMM("encoder_patch_embed", 1, h, patch_dim, gemm_qm))
+
+        # ViT transformer layers — each has QKV, attention (as ElementWise since
+        # ViT dims are not in context_attention_perf), proj, FFN up, FFN down.
+        # ViT self-attention is dense (no KV cache/paging), so the softmax(QK^T)V
+        # computation is well-approximated by its memory bandwidth cost.
+        for i in range(num_layers):
+            prefix = f"encoder_layer{i}"
+            self.encoder_ops.extend([
+                ops.GEMM(f"{prefix}_qkv_gemm", 1, 3 * h, h, gemm_qm),
+                ops.ElementWise(f"{prefix}_attn", 1, num_heads * head_dim, num_heads * head_dim, 0.8),
+                ops.GEMM(f"{prefix}_proj_gemm", 1, h, h, gemm_qm),
+                ops.GEMM(f"{prefix}_ffn_up_gemm", 1, inter, h, gemm_qm),
+                ops.GEMM(f"{prefix}_ffn_down_gemm", 1, h, inter, gemm_qm),
+            ])
+
+        # Vision-to-LLM projector (maps encoder hidden to LLM hidden)
+        self.encoder_ops.append(
+            ops.GEMM("encoder_projector", 1, self._hidden_size, h, gemm_qm)
+        )
+
+        logger.info(
+            "Built vision encoder ops: %d layers, %d total ops, hidden=%d, inter=%d",
+            num_layers, len(self.encoder_ops), h, inter,
+        )
+
+    def get_encoder_weight_bytes(self) -> float:
+        """Total encoder weight memory in bytes."""
+        return sum(op.get_weights() for op in self.encoder_ops)
 
 
 class HybridMoEModel(BaseModel):

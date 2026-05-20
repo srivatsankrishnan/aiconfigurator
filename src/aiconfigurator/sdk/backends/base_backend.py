@@ -34,6 +34,54 @@ class BaseBackend(ABC):
         _get_memory_usage: this is backend-specific. It should be implemented in the subclass.
     """
 
+    def _run_encoder_phase(
+        self,
+        model: BaseModel,
+        database: PerfDatabase,
+        runtime_config: RuntimeConfig,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """Run vision encoder ops and return latency/energy breakdowns.
+
+        Returns empty dicts when the model has no encoder_ops (text-only).
+        The effective sequence length is the number of image patches after
+        applying EVS pruning (``video_pruning_rate``).
+        """
+        encoder_latency_dict = defaultdict(float)
+        encoder_energy_wms_dict = defaultdict(float)
+
+        if not model.encoder_ops:
+            return encoder_latency_dict, encoder_energy_wms_dict
+
+        # Compute effective patch count
+        num_patches = runtime_config.num_image_patches
+        if num_patches == 0 and runtime_config.num_video_frames > 0:
+            vision_enc = getattr(model, "_vision_encoder", None)
+            patches_per_frame = 1
+            if vision_enc is not None:
+                grid = vision_enc.image_size // vision_enc.patch_size
+                patches_per_frame = grid * grid
+            num_patches = runtime_config.num_video_frames * patches_per_frame
+
+        if num_patches == 0:
+            return encoder_latency_dict, encoder_energy_wms_dict
+
+        effective_patches = max(1, int(num_patches * (1.0 - runtime_config.video_pruning_rate)))
+
+        for op in model.encoder_ops:
+            result = op.query(
+                database,
+                x=effective_patches,
+                batch_size=1,
+                beam_width=1,
+                s=effective_patches,
+                prefix=0,
+                model_name=getattr(model, "model_name", ""),
+            )
+            encoder_latency_dict[op._name] += float(result)
+            encoder_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+
+        return encoder_latency_dict, encoder_energy_wms_dict
+
     def _run_context_phase(
         self,
         model: BaseModel,
@@ -180,7 +228,12 @@ class BaseBackend(ABC):
             generation_latency_dict,
             _,
         ) = self._run_static_breakdown(model, database, runtime_config, mode, stride, latency_correction_scale)
-        return sum(context_latency_dict.values()) + sum(generation_latency_dict.values())
+        encoder_latency_dict, _ = self._run_encoder_phase(model, database, runtime_config)
+        return (
+            sum(encoder_latency_dict.values())
+            + sum(context_latency_dict.values())
+            + sum(generation_latency_dict.values())
+        )
 
     def run_static(
         self,
@@ -222,6 +275,12 @@ class BaseBackend(ABC):
             generation_energy_wms_dict,
         ) = self._run_static_breakdown(model, database, runtime_config, mode, stride, latency_correction_scale)
 
+        # Encoder phase (vision/audio) — adds to TTFT for multimodal models.
+        # Returns empty dicts for text-only models (zero overhead).
+        encoder_latency_dict, encoder_energy_wms_dict = self._run_encoder_phase(
+            model, database, runtime_config,
+        )
+
         if mode == "static_ctx":
             memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, 1, prefix=prefix)
         elif mode == "static_gen":
@@ -239,6 +298,9 @@ class BaseBackend(ABC):
             memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, osl, prefix=prefix)
 
         # Calculate total latencies and energies (simple sums - decoupled!)
+        encoder_latency_ms = sum(encoder_latency_dict.values())
+        encoder_energy_wms = sum(encoder_energy_wms_dict.values())
+
         context_latency_ms = sum(context_latency_dict.values())  # milliseconds
         context_energy_wms = sum(context_energy_wms_dict.values())  # watt-milliseconds
 
@@ -246,12 +308,14 @@ class BaseBackend(ABC):
         generation_energy_wms = sum(generation_energy_wms_dict.values())  # watt-milliseconds
 
         # Calculate average power (SIMPLIFIED - just divide! Single operation.)
-        context_power_avg = context_energy_wms / context_latency_ms if context_latency_ms > 0 else 0.0
+        prefill_latency_ms = encoder_latency_ms + context_latency_ms
+        prefill_energy_wms = encoder_energy_wms + context_energy_wms
+        context_power_avg = prefill_energy_wms / prefill_latency_ms if prefill_latency_ms > 0 else 0.0
         generation_power_avg = generation_energy_wms / generation_latency_ms if generation_latency_ms > 0 else 0.0
 
         # E2E weighted average power (EVEN SIMPLER - natural weighted average!)
-        total_latency_ms = context_latency_ms + generation_latency_ms
-        total_energy_wms = context_energy_wms + generation_energy_wms
+        total_latency_ms = prefill_latency_ms + generation_latency_ms
+        total_energy_wms = prefill_energy_wms + generation_energy_wms
         e2e_power_avg = total_energy_wms / total_latency_ms if total_latency_ms > 0 else 0.0
 
         # For backward compatibility, keep old variable names
@@ -261,7 +325,7 @@ class BaseBackend(ABC):
         bs = batch_size
         global_bs = bs * model.config.attention_dp_size
         concurrency = global_bs
-        ttft = context_latency
+        ttft = encoder_latency_ms + context_latency
         tpot = 0.0 if osl <= 1 else generation_latency / (osl - 1)
         num_generated_tokens = max(osl - 1, 0)
         request_latency = ttft + tpot * num_generated_tokens
